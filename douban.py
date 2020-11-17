@@ -5,6 +5,9 @@
 # @Software: PyCharm
 
 from typing import List
+from functools import wraps
+import time
+import os
 
 from bs4 import BeautifulSoup  # 网页解析，获取数据
 import re  # 正则表达式，文字匹配
@@ -12,7 +15,10 @@ import urllib.request, urllib.error  # 定制url，获取网页数据
 import xlwt  # 对excel2003格式文件xls进行写操作
 import xlsxwriter as xxwt  # 对excel2007格式文件xlsx进行写操作
 import sqlite3  # 进行数据库操作
-
+import asyncio  # 协程实现异步io
+import aiohttp  # 异步爬取数据
+from multiprocessing import Pool as ProcessPool # 实现多进程
+from multiprocessing.dummy import Pool as ThreadPool # 实现多线程
 
 def main():
     baseUrl = 'https://movie.douban.com/top250?start='
@@ -21,11 +27,20 @@ def main():
     dbpath = r'./data/db/movie.db'
 
     # 爬取网页并解析数据
-    datalist = getData(baseUrl)
+    # 同步方式爬取数据
+    # datalist = getData(baseUrl)
+    # 协程 异步方式爬取数据
+    datalist = getDataAsync1(baseUrl)
+    # 多线程 异步方式爬取数据
+    # datalist = getDataAsync2(baseUrl)
+    # 多进程 异步方式爬取数据
+    # datalist = getDataAsync3(baseUrl)
 
     # 保存数据
     # saveData2excel(savepath, datalist)
-    saveData2db(dbpath, datalist)
+    # saveData2db(dbpath, datalist)
+
+    # print("\n", "-"*50, "\n", datalist)
 
 
 # 影片详情链接
@@ -43,9 +58,18 @@ patt_intr = re.compile(r'<span class="inq">(.*?)</span>')
 # 相关内容
 patt_about = re.compile(r'<p class="">(.*?)</p>', re.S)
 
+def showRunTime(f):
+    @wraps(f)
+    def func(*args, **kwargs):
+        st = time.time()
+        res = f(*args, **kwargs)
+        ed = time.time()
+
+        print(f"{f.__doc__} 耗时 {ed-st} 秒 len(result)={len(res)}")
+        return res
+    return func
 
 def askUrl(url: str) -> str:
-    print(f'开始爬取数据 url: {url}')
     head = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36'
     }
@@ -53,9 +77,10 @@ def askUrl(url: str) -> str:
     req = urllib.request.Request(url, headers=head)
 
     try:
+        print(f'开始爬取数据 url: {url}')
         response = urllib.request.urlopen(req, timeout=3)
         html = response.read().decode('utf-8')
-        print(f'爬取数据成功')
+        print(f'爬取数据成功 url: {url}')
     except urllib.error.URLError as e:
         if hasattr(e, 'code'):
             print(e.code)
@@ -64,65 +89,114 @@ def askUrl(url: str) -> str:
 
     return html
 
+async def askUrlAsync(url: str, datalist: List[List]) -> str:
+    async with aiohttp.ClientSession() as session:
+        print(f'开始爬取数据 url: {url}')
+        async with session.get(url) as response:
+            print(f'爬取数据成功 url: {url}')
+            html = await response.text()
+            datas = parseData(html)
+            datalist.extend(datas)
 
+@showRunTime
 def getData(baseurl: str) -> List[List]:
+    """同步方式爬取数据"""
     datalist = []
 
-    for i in range(10):
-        html = askUrl(baseurl + str(i * 25))
-        soup = BeautifulSoup(html, 'lxml')
-        for item in soup.find_all('div', class_='item'):
-            data = []
-            item = str(item)
-            # 影片详情链接
-            li = patt_a.findall(item)[0]
-            data.append(li)
-            # 影片图片
-            li = patt_img.findall(item)[0]
-            data.append(li)
-            # 影片片名 中文
-            lis = patt_name.findall(item)
-            data.append(lis[0])
-            # 影片片名 外文
-            if len(lis) == 2:
-                data.append(lis[1].replace('/', '').strip())
-            else:
-                data.append(' ')
-            # 影片评分
-            li = patt_rate.findall(item)[0]
-            data.append(li)
-            # 评价人数
-            li = patt_judge.findall(item)[0]
-            data.append(li)
-            # 概述
-            li = patt_intr.findall(item)
-            if len(li) > 0:
-                li = li[0].replace('。', '')
-                data.append(li)
-            else:
-                data.append(' ')
-            # 相关内容
-            li = patt_about.findall(item, re.S)[0]
-            li.replace('/', ' ')
-            li = re.sub(r'<br\s*/\s*>', ' ', li)
-            mt = re.search(r'(导演.*)\n.*(\d{4}).* / (\D*?) / (.*)$', li.strip())
-            if mt is None:
-                print(li.strip(), '\n')
-            actor, year, country, keys = mt.groups()
-            # 导演、演员
-            data.append(actor.strip())
-            # 年份
-            data.append(year.strip())
-            # 国家
-            data.append(country.strip())
-            # 关键词
-            data.append(keys.strip())
+    urls = [baseurl + str(i * 25) for i in range(10)]
+    for url in urls:
+        html = askUrl(url)
+        datas = parseData(html)
+        datalist.extend(datas)
 
-            datalist.append(data)
-
-    # print(datalist[0])
     return datalist
 
+@showRunTime
+def getDataAsync1(baseurl: str) -> List[List]:
+    """协程 异步方式爬取数据"""
+    datalist = []
+    urls = [baseurl + str(i * 25) for i in range(10)]
+
+    coroutines = [askUrlAsync(url, datalist) for url in urls]
+    coroutine = asyncio.wait(coroutines)
+    asyncio.run(coroutine)
+
+    return datalist
+
+@showRunTime
+def getDataAsync2(baseurl: str) -> List[List]:
+    """多线程 异步方式爬取数据"""
+    datalist = []
+    urls = [baseurl + str(i * 25) for i in range(10)]
+    with ThreadPool() as pool:
+        htmls = pool.map(askUrl, urls)
+    for html in htmls:
+        datalist.extend(parseData(html))
+    return datalist
+
+@showRunTime
+def getDataAsync3(baseurl: str, process_num=os.cpu_count()) -> List[List]:
+    """多进程 异步方式爬取数据"""
+    datalist = []
+    urls = [baseurl + str(i * 25) for i in range(10)]
+    with ProcessPool(process_num) as pool:
+        htmls = pool.map(askUrl, urls)
+    for html in htmls:
+        datalist.extend(parseData(html))
+    return datalist
+
+def parseData(html) -> List[List]:
+    soup = BeautifulSoup(html, 'lxml')
+    datalist = []
+    for item in soup.find_all('div', class_='item'):
+        data = []
+        item = str(item)
+        # 影片详情链接
+        li = patt_a.findall(item)[0]
+        data.append(li)
+        # 影片图片
+        li = patt_img.findall(item)[0]
+        data.append(li)
+        # 影片片名 中文
+        lis = patt_name.findall(item)
+        data.append(lis[0])
+        # 影片片名 外文
+        if len(lis) == 2:
+            data.append(lis[1].replace('/', '').strip())
+        else:
+            data.append(' ')
+        # 影片评分
+        li = patt_rate.findall(item)[0]
+        data.append(li)
+        # 评价人数
+        li = patt_judge.findall(item)[0]
+        data.append(li)
+        # 概述
+        li = patt_intr.findall(item)
+        if len(li) > 0:
+            li = li[0].replace('。', '')
+            data.append(li)
+        else:
+            data.append(' ')
+        # 相关内容
+        li = patt_about.findall(item, re.S)[0]
+        li.replace('/', ' ')
+        li = re.sub(r'<br\s*/\s*>', ' ', li)
+        mt = re.search(r'(导演.*)\n.*(\d{4}).* / (\D*?) / (.*)$', li.strip())
+        if mt is None:
+            print(li.strip(), '\n')
+        actor, year, country, keys = mt.groups()
+        # 导演、演员
+        data.append(actor.strip())
+        # 年份
+        data.append(year.strip())
+        # 国家
+        data.append(country.strip())
+        # 关键词
+        data.append(keys.strip())
+
+        datalist.append(data)
+    return datalist
 
 def saveData2excel(savepath: str, datalist: List[List]) -> None:
     if not isinstance(savepath, str):
